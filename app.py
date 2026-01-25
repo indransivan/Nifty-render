@@ -46,7 +46,7 @@ def get_nifty_data():
 
     df15 = (
         df.set_index("datetime")
-        .resample("15T")
+        .resample("15min")
         .agg({
             "open": "first",
             "high": "max",
