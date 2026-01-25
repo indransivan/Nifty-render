@@ -1,259 +1,178 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import yfinance as yf
+import streamlit as st
 import pandas as pd
-import pytz
-from datetime import datetime
-import traceback
+import numpy as np
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import os
+from breeze_connect import BreezeConnect
+import time
 
-app = FastAPI()
+# Config
+st.set_page_config(layout="wide", page_title="Nifty MACD Dashboard")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Load credentials from env vars (Render secrets)
+@st.cache_resource
+def init_breeze():
+    api_key = os.getenv("BREEZE_API_KEY")
+    api_secret = os.getenv("BREEZE_API_SECRET") 
+    session_token = os.getenv("BREEZE_SESSION_TOKEN")
+    
+    breeze = BreezeConnect(api_key=api_key)
+    breeze.generate_session(api_secret=api_secret, session_token=session_token)
+    return breeze
 
-def get_nifty_data_safe():
-    """100% crash-proof Nifty data fetcher"""
+def calculate_macd_signals(df):
+    exp1 = df['close'].ewm(span=12).mean()
+    exp2 = df['close'].ewm(span=26).mean()
+    macd = exp1 - exp2
+    signal = macd.ewm(span=9).mean()
+    histogram = macd - signal
+    
+    macd_prev = macd.shift(1)
+    signal_prev = signal.shift(1)
+    
+    buy_signal = (macd > 0) & (macd_prev <= 0)
+    sell_signal = (macd < 0) & (macd_prev >= 0)
+    
+    return macd, signal, histogram, buy_signal, sell_signal
+
+def main():
+    st.title("🚀 Nifty 15min MACD Trading Dashboard")
+    st.sidebar.header("⚙️ Controls")
+    
+    if st.sidebar.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+    
     try:
-        print("📡 Fetching Nifty data...")
+        # Initialize Breeze
+        with st.spinner("Connecting to Breeze API..."):
+            breeze = init_breeze()
         
-        # Simple data fetch
-        ticker = yf.Ticker("^NSEI")
-        hist = ticker.history(period="5d", interval="5m")
+        # Fetch data
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=10)
+        fmt = "%Y-%m-%d %H:%M:%S"
         
-        if hist.empty:
-            print("❌ No data returned")
-            return None
+        hist_data = breeze.get_historical_data_v2(
+            interval="5minute",
+            from_date=start_date.strftime(fmt),
+            to_date=end_date.strftime(fmt),
+            stock_code="NIFTY",
+            exchange_code="NSE",
+            product_type="cash"
+        )
+        
+        df_5min = pd.DataFrame(hist_data['Success'])
+        df_5min['datetime'] = pd.to_datetime(df_5min['datetime'])
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df_5min[col] = pd.to_numeric(df_5min[col], errors='coerce')
+        
+        # Resample to 15min
+        df_15min = df_5min.set_index('datetime').resample('15T').agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 
+            'close': 'last', 'volume': 'sum'
+        }).dropna().reset_index()
+        
+        df_15min['index'] = range(len(df_15min))
+        
+        # Calculate signals
+        macd, signal_line, histogram, buy_signals, sell_signals = calculate_macd_signals(df_15min)
+        
+        # Dashboard
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.subheader("📈 Nifty 15min Price + Signals")
+            fig_price = go.Figure()
             
-        print(f"✅ Got {len(hist)} bars")
+            fig_price.add_trace(go.Candlestick(
+                x=df_15min['index'],
+                open=df_15min['open'], high=df_15min['high'], 
+                low=df_15min['low'], close=df_15min['close'],
+                name="Nifty 15min",
+                increasing_line_color='#00ff88', decreasing_line_color='#ff4444'
+            ))
+            
+            if buy_signals.sum() > 0:
+                buy_idx = df_15min['index'][buy_signals]
+                fig_price.add_trace(go.Scatter(
+                    x=buy_idx, y=df_15min.loc[buy_signals, 'low'].values * 0.998,
+                    mode='markers', marker=dict(symbol='triangle-up', size=15, color='green'),
+                    name='🟢 BUY', showlegend=True
+                ))
+            
+            if sell_signals.sum() > 0:
+                sell_idx = df_15min['index'][sell_signals]
+                fig_price.add_trace(go.Scatter(
+                    x=sell_idx, y=df_15min.loc[sell_signals, 'high'].values * 1.002,
+                    mode='markers', marker=dict(symbol='triangle-down', size=15, color='red'),
+                    name='🔴 SELL', showlegend=True
+                ))
+            
+            # X-axis formatting
+            n_ticks = min(12, len(df_15min)//10 + 1)
+            tick_pos = np.linspace(0, len(df_15min)-1, n_ticks, dtype=int)
+            tick_lbl = [df_15min['datetime'].iloc[i].strftime('%m-%d %H:%M') 
+                       for i in tick_pos]
+            
+            fig_price.update_xaxes(tickmode='array', tickvals=tick_pos, ticktext=tick_lbl,
+                                 tickangle=-45, rangeslider_visible=False)
+            fig_price.update_layout(height=500, template='plotly_white', showlegend=True)
+            st.plotly_chart(fig_price, use_container_width=True)
         
-        # Safe timezone handling
-        hist = hist.tz_localize('Asia/Kolkata') if hist.index.tz is None else hist
+        with col2:
+            st.subheader("🎯 Live Alerts")
+            
+            latest_macd = macd.iloc[-1]
+            latest_signal = signal_line.iloc[-1]
+            latest_close = df_15min['close'].iloc[-1]
+            
+            st.metric("Current Price", f"₹{latest_close:.0f}")
+            st.metric("MACD", f"{latest_macd:.2f}", 
+                     f"{macd.iloc[-2]:.2f}")
+            st.metric("Signal", f"{latest_signal:.2f}", 
+                     f"{signal_line.iloc[-2]:.2f}")
+            
+            trend = "🟢 BULLISH" if latest_macd > latest_signal else "🔴 BEARISH"
+            st.metric("TREND", trend)
+            
+            st.info(f"**BUY Signals:** {buy_signals.sum()}")
+            st.warning(f"**SELL Signals:** {sell_signals.sum()}")
+            
+            if buy_signals.iloc[-1]:
+                st.success("🟢 **FRESH BUY SIGNAL!**")
+            elif sell_signals.iloc[-1]:
+                st.error("🔴 **FRESH SELL SIGNAL!**")
+            else:
+                st.info("⚪ **WAIT** - No fresh crossover")
         
-        # Filter market hours (simple)
-        hist = hist.between_time("09:00", "16:00")
+        # MACD subplot
+        st.subheader("📊 MACD (12,26,9)")
+        fig_macd = go.Figure()
         
-        if len(hist) < 20:  # Need minimum data for MACD
-            print("❌ Insufficient data")
-            return None
+        fig_macd.add_trace(go.Bar(x=df_15min['index'], y=histogram,
+                                 marker_color=['green' if h>=0 else 'red' for h in histogram],
+                                 name='Histogram', opacity=0.7))
         
-        # Current price (safe)
-        current_price = float(hist['Close'].iloc[-1])
-        timestamp = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S')
+        fig_macd.add_trace(go.Scatter(x=df_15min['index'], y=macd,
+                                     line=dict(color='#2962FF', width=2.5), name='MACD'))
+        fig_macd.add_trace(go.Scatter(x=df_15min['index'], y=signal_line,
+                                     line=dict(color='#FF6D00', width=2.5), name='Signal'))
         
-        # MACD calculation (safe)
-        closes = hist['Close'].dropna().tail(100).values  # Last 100 bars max
-        macd_line = pd.Series(closes).ewm(span=12).mean() - pd.Series(closes).ewm(span=26).mean()
-        signal_line = macd_line.ewm(span=9).mean()
-        histogram = macd_line - signal_line
+        fig_macd.update_layout(height=400, template='plotly_white', 
+                              hovermode='x unified', showlegend=True)
+        fig_macd.update_xaxes(tickmode='array', tickvals=tick_pos, ticktext=tick_lbl,
+                             tickangle=-45)
+        st.plotly_chart(fig_macd, use_container_width=True)
         
-        # Simple signals
-        buy_signals = []
-        sell_signals = []
-        for i in range(1, min(50, len(macd_line))):
-            if macd_line.iloc[i] > 0 and macd_line.iloc[i-1] <= 0:
-                buy_signals.append(i)
-            if macd_line.iloc[i] < 0 and macd_line.iloc[i-1] >= 0:
-                sell_signals.append(i)
-        
-        return {
-            "success": True,
-            "price": current_price,
-            "time": timestamp,
-            "closes": closes[-50:].tolist(),  # Last 50 bars
-            "macd": macd_line[-50:].tolist(),
-            "signal": signal_line[-50:].tolist(),
-            "histogram": histogram[-50:].tolist(),
-            "buy_signals": buy_signals[-10:],  # Last 10
-            "sell_signals": sell_signals[-10:],
-            "status": "BULLISH" if macd_line.iloc[-1] > 0 else "BEARISH"
-        }
+        st.success(f"✅ Dashboard updated: {len(df_15min)} candles")
         
     except Exception as e:
-        print(f"❌ FULL ERROR: {traceback.format_exc()}")
-        return None
-
-@app.get("/")
-async def home():
-    return HTMLResponse("""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Nifty Live MACD 📈</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-    <style>
-        body { 
-            margin: 0; padding: 20px; 
-            background: #0a0a0f; 
-            color: white; 
-            font-family: -apple-system, sans-serif;
-            min-height: 100vh;
-        }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .header { 
-            text-align: center; 
-            background: linear-gradient(45deg, #1e3a8a, #3b82f6); 
-            padding: 30px; 
-            border-radius: 20px; 
-            margin-bottom: 30px;
-        }
-        .price { 
-            font-size: 3em; 
-            color: #ffd700; 
-            text-shadow: 0 0 30px #ffd700;
-            margin: 10px 0;
-        }
-        #chart { width: 100%; height: 70vh; border-radius: 15px; }
-        button { 
-            background: #ef4444; 
-            color: white; 
-            border: none; 
-            padding: 15px 30px; 
-            border-radius: 50px; 
-            font-size: 18px; 
-            cursor: pointer; 
-            margin: 10px;
-        }
-        button:hover { background: #dc2626; transform: scale(1.05); }
-        .status { 
-            text-align: center; 
-            font-size: 1.5em; 
-            margin: 20px 0; 
-            padding: 20px; 
-            border-radius: 15px; 
-            background: rgba(255,255,255,0.1);
-        }
-        .bullish { border: 3px solid #10b981; background: rgba(16,185,129,0.2); }
-        .bearish { border: 3px solid #ef4444; background: rgba(239,68,68,0.2); }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>📈 Nifty 50 Live + MACD Dashboard</h1>
-            <div class="price" id="price">Loading...</div>
-            <div id="time"></div>
-        </div>
-        
-        <div class="status" id="status">Loading...</div>
-        
-        <div id="chart"></div>
-        
-        <div style="text-align: center; margin: 30px 0;">
-            <button onclick="loadData()">🔄 Refresh Now</button>
-            <button id="autoBtn" onclick="toggleAuto()">▶ Auto Update: OFF</button>
-        </div>
-    </div>
-
-    <script>
-        let autoInterval = null;
-        
-        async function loadData() {
-            try {
-                const res = await fetch('/api/nifty');
-                const data = await res.json();
-                
-                if (!data.success) {
-                    document.getElementById('status').innerHTML = '❌ No market data';
-                    return;
-                }
-                
-                // Update UI
-                document.getElementById('price').textContent = `₹${data.price.toFixed(2)}`;
-                document.getElementById('time').textContent = data.time;
-                
-                const statusEl = document.getElementById('status');
-                statusEl.textContent = `MACD: ${data.macd[data.macd.length-1].toFixed(3)} | ${data.status}`;
-                statusEl.className = `status ${data.status.toLowerCase()}`;
-                
-                // Chart
-                const x = Array(data.closes.length).fill().map((_, i) => i);
-                
-                const traces = [
-                    {
-                        x: x, y: data.closes, 
-                        type: 'scatter', mode: 'lines',
-                        name: 'Nifty Price', line: {color: '#3b82f6', width: 3}
-                    },
-                    {
-                        x: x, y: Array(x.length).fill(data.price),
-                        type: 'scatter', mode: 'lines',
-                        name: 'Live Price', line: {color: '#ef4444', width: 2, dash: 'dash'}
-                    },
-                    {
-                        x: x, y: data.macd,
-                        type: 'scatter', mode: 'lines',
-                        name: 'MACD', line: {color: '#10b981', width: 2}, yaxis: 'y2'
-                    },
-                    {
-                        x: x, y: data.signal,
-                        type: 'scatter', mode: 'lines',
-                        name: 'Signal', line: {color: '#f59e0b', width: 2}, yaxis: 'y2'
-                    },
-                    {
-                        x: x, y: data.histogram,
-                        type: 'bar', name: 'Histogram',
-                        marker: {color: '#6b7280'}, opacity: 0.4, yaxis: 'y2'
-                    }
-                ];
-                
-                // Buy/Sell signals
-                if (data.buy_signals.length > 0) {
-                    traces.push({
-                        x: data.buy_signals, y: data.buy_signals.map((_, i) => data.macd[data.buy_signals[i]] || 0),
-                        mode: 'markers', name: 'BUY ▲',
-                        marker: {size: 12, color: '#10b981', symbol: 'triangle-up'}, yaxis: 'y2'
-                    });
-                }
-                
-                Plotly.newPlot('chart', traces, {
-                    height: window.innerHeight * 0.6,
-                    grid: {rows: 2, cols: 1, rowHeights: [0.6, 0.4]},
-                    template: 'plotly_dark',
-                    yaxis: {title: 'Price ₹'},
-                    yaxis2: {title: 'MACD', overlaying: 'y', side: 'right'},
-                    margin: {t: 30}
-                });
-                
-            } catch (e) {
-                console.error(e);
-                document.getElementById('status').innerHTML = 'Error: ' + e.message;
-            }
-        }
-        
-        function toggleAuto() {
-            const btn = document.getElementById('autoBtn');
-            if (autoInterval) {
-                clearInterval(autoInterval);
-                btn.textContent = '▶ Auto Update: OFF';
-                autoInterval = null;
-            } else {
-                autoInterval = setInterval(loadData, 15000);
-                btn.textContent = '⏸ Auto Update: ON';
-            }
-        }
-        
-        // Start
-        loadData();
-        setTimeout(toggleAuto, 3000);
-    </script>
-</body>
-</html>
-    """)
-
-@app.get("/api/nifty")
-def api_nifty():
-    data = get_nifty_data_safe()
-    if data is None:
-        return JSONResponse({"success": False, "error": "No data"}, status_code=500)
-    return data
+        st.error(f"❌ Error: {str(e)}")
+        st.info("**Setup Render Environment Variables:**\n\n"
+                "1. BREEZE_API_KEY\n"
+                "2. BREEZE_API_SECRET\n" 
+                "3. BREEZE_SESSION_TOKEN")
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    main()
