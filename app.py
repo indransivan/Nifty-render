@@ -1,122 +1,135 @@
 import os
-import time
+from flask import Flask, jsonify
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from breeze_connect import BreezeConnect
 
+app = Flask(__name__)
+
 # =========================
-# LOAD ENV VARIABLES
+# ENV VARIABLES
 # =========================
 API_KEY = os.environ.get("BREEZE_API_KEY")
 API_SECRET = os.environ.get("BREEZE_API_SECRET")
 SESSION_TOKEN = os.environ.get("BREEZE_SESSION_TOKEN")
 
 # =========================
-# LOGIN
+# BREEZE LOGIN (once)
 # =========================
 breeze = BreezeConnect(api_key=API_KEY)
 breeze.generate_session(api_secret=API_SECRET, session_token=SESSION_TOKEN)
 
-print("✅ Breeze login successful")
+# =========================
+# CORE LOGIC
+# =========================
+def get_nifty_data():
+    end = datetime.now()
+    start = end - timedelta(days=10)
+    fmt = "%Y-%m-%d %H:%M:%S"
+
+    hist = breeze.get_historical_data_v2(
+        interval="5minute",
+        from_date=start.strftime(fmt),
+        to_date=end.strftime(fmt),
+        stock_code="NIFTY",
+        exchange_code="NSE",
+        product_type="cash"
+    )
+
+    df = pd.DataFrame(hist["Success"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df15 = (
+        df.set_index("datetime")
+        .resample("15T")
+        .agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum"
+        })
+        .dropna()
+        .reset_index()
+    )
+
+    return df15
+
+def macd_signals(df):
+    exp1 = df["close"].ewm(span=12).mean()
+    exp2 = df["close"].ewm(span=26).mean()
+
+    macd = exp1 - exp2
+    signal = macd.ewm(span=9).mean()
+
+    buy = (macd > 0) & (macd.shift(1) <= 0)
+    sell = (macd < 0) & (macd.shift(1) >= 0)
+
+    return macd, signal, buy, sell
 
 # =========================
-# FETCH DATA
+# ROUTES
 # =========================
-end_date = datetime.now()
-start_date = end_date - timedelta(days=10)
-fmt = "%Y-%m-%d %H:%M:%S"
+@app.route("/")
+def chart():
+    df = get_nifty_data()
+    macd, signal, buy, sell = macd_signals(df)
 
-hist_data = breeze.get_historical_data_v2(
-    interval="5minute",
-    from_date=start_date.strftime(fmt),
-    to_date=end_date.strftime(fmt),
-    stock_code="NIFTY",
-    exchange_code="NSE",
-    product_type="cash"
-)
+    fig = go.Figure()
 
-df = pd.DataFrame(hist_data["Success"])
-df["datetime"] = pd.to_datetime(df["datetime"])
+    fig.add_trace(go.Candlestick(
+        x=df["datetime"],
+        open=df["open"],
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        name="NIFTY 15m"
+    ))
 
-for col in ["open", "high", "low", "close", "volume"]:
-    df[col] = pd.to_numeric(df[col], errors="coerce")
+    fig.add_trace(go.Scatter(
+        x=df.loc[buy, "datetime"],
+        y=df.loc[buy, "low"] * 0.998,
+        mode="markers",
+        marker=dict(symbol="triangle-up", size=14, color="green"),
+        name="BUY"
+    ))
 
-# =========================
-# RESAMPLE TO 15 MIN
-# =========================
-df_15 = (
-    df.set_index("datetime")
-    .resample("15T")
-    .agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum"
-    })
-    .dropna()
-    .reset_index()
-)
+    fig.add_trace(go.Scatter(
+        x=df.loc[sell, "datetime"],
+        y=df.loc[sell, "high"] * 1.002,
+        mode="markers",
+        marker=dict(symbol="triangle-down", size=14, color="red"),
+        name="SELL"
+    ))
 
-df_15["index"] = range(len(df_15))
+    fig.update_layout(title="NIFTY 15m MACD Signals", template="plotly_white")
 
-# =========================
-# MACD LOGIC
-# =========================
-exp1 = df_15["close"].ewm(span=12).mean()
-exp2 = df_15["close"].ewm(span=26).mean()
-macd = exp1 - exp2
-signal = macd.ewm(span=9).mean()
+    return fig.to_html(full_html=True)
 
-buy_signal = (macd > 0) & (macd.shift(1) <= 0)
-sell_signal = (macd < 0) & (macd.shift(1) >= 0)
+@app.route("/signal")
+def signal_api():
+    df = get_nifty_data()
+    macd, signal, buy, sell = macd_signals(df)
 
-# =========================
-# SAVE CHART (HTML)
-# =========================
-fig = go.Figure()
+    latest = {
+        "time": df["datetime"].iloc[-1].isoformat(),
+        "close": round(df["close"].iloc[-1], 2),
+        "macd": round(macd.iloc[-1], 2),
+        "signal": round(signal.iloc[-1], 2),
+        "trend": "BULLISH" if macd.iloc[-1] > signal.iloc[-1] else "BEARISH",
+        "buy": bool(buy.iloc[-1]),
+        "sell": bool(sell.iloc[-1])
+    }
 
-fig.add_trace(go.Candlestick(
-    x=df_15["datetime"],
-    open=df_15["open"],
-    high=df_15["high"],
-    low=df_15["low"],
-    close=df_15["close"],
-    name="NIFTY 15m"
-))
-
-fig.add_trace(go.Scatter(
-    x=df_15.loc[buy_signal, "datetime"],
-    y=df_15.loc[buy_signal, "low"] * 0.998,
-    mode="markers",
-    marker=dict(symbol="triangle-up", size=14, color="green"),
-    name="BUY"
-))
-
-fig.add_trace(go.Scatter(
-    x=df_15.loc[sell_signal, "datetime"],
-    y=df_15.loc[sell_signal, "high"] * 1.002,
-    mode="markers",
-    marker=dict(symbol="triangle-down", size=14, color="red"),
-    name="SELL"
-))
-
-fig.update_layout(title="NIFTY 15m MACD Signals", template="plotly_white")
-
-fig.write_html("nifty_macd.html")
-
-print("📊 Chart saved as nifty_macd.html")
+    return jsonify(latest)
 
 # =========================
-# CONSOLE ALERT
+# ENTRY POINT
 # =========================
-if buy_signal.iloc[-1]:
-    print("🟢 BUY SIGNAL DETECTED")
-elif sell_signal.iloc[-1]:
-    print("🔴 SELL SIGNAL DETECTED")
-else:
-    print("⚪ NO SIGNAL")
-
-print("✅ Script execution completed")
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
