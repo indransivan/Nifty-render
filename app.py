@@ -8,7 +8,7 @@ from breeze_connect import BreezeConnect
 app = Flask(__name__)
 
 # ==========================================================
-# ENV VARIABLES (SET IN RENDER DASHBOARD)
+# ENV VARIABLES (SET IN RENDER)
 # ==========================================================
 API_KEY = os.environ.get("BREEZE_API_KEY")
 API_SECRET = os.environ.get("BREEZE_API_SECRET")
@@ -23,7 +23,7 @@ breeze.generate_session(api_secret=API_SECRET, session_token=SESSION_TOKEN)
 print("✅ Breeze login successful")
 
 # ==========================================================
-# FETCH + CLEAN DATA
+# DATA FETCH + CLEAN
 # ==========================================================
 def get_nifty_15min():
     end = datetime.utcnow()
@@ -42,7 +42,7 @@ def get_nifty_15min():
     df = pd.DataFrame(hist["Success"])
     df["datetime"] = pd.to_datetime(df["datetime"])
 
-    # ---------- TIMEZONE SAFE CONVERSION ----------
+    # Timezone-safe
     if df["datetime"].dt.tz is None:
         df["datetime"] = df["datetime"].dt.tz_localize("Asia/Kolkata")
     else:
@@ -51,13 +51,13 @@ def get_nifty_15min():
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # ---------- FILTER NSE MARKET HOURS ----------
+    # Market hours only
     df = df[
         (df["datetime"].dt.time >= pd.to_datetime("09:15").time()) &
         (df["datetime"].dt.time <= pd.to_datetime("15:30").time())
     ]
 
-    # ---------- RESAMPLE TO 15 MIN ----------
+    # Resample to 15min
     df15 = (
         df.set_index("datetime")
         .resample("15min")
@@ -71,6 +71,9 @@ def get_nifty_15min():
         .dropna()
         .reset_index()
     )
+
+    # 🔥 COMPRESSED SESSION INDEX (NO GAPS)
+    df15["x"] = range(len(df15))
 
     return df15
 
@@ -99,52 +102,55 @@ def chart():
 
     fig = go.Figure()
 
+    # Candles (INDEX X-AXIS)
     fig.add_trace(go.Candlestick(
-        x=df["datetime"],
+        x=df["x"],
         open=df["open"],
         high=df["high"],
         low=df["low"],
         close=df["close"],
-        name="NIFTY 15m"
+        name="NIFTY 15m",
+        hovertext=df["datetime"].dt.strftime("%Y-%m-%d %H:%M"),
+        hoverinfo="text"
     ))
 
+    # BUY markers
     fig.add_trace(go.Scatter(
-        x=df.loc[buy, "datetime"],
+        x=df.loc[buy, "x"],
         y=df.loc[buy, "low"] * 0.998,
         mode="markers",
         marker=dict(symbol="triangle-up", size=14, color="green"),
         name="BUY"
     ))
 
+    # SELL markers
     fig.add_trace(go.Scatter(
-        x=df.loc[sell, "datetime"],
+        x=df.loc[sell, "x"],
         y=df.loc[sell, "high"] * 1.002,
         mode="markers",
         marker=dict(symbol="triangle-down", size=14, color="red"),
         name="SELL"
     ))
-############################################
-fig.update_layout(
-    title="NIFTY 15min MACD (09:15–15:30 IST)",
-    template="plotly_white",
-    height=600,
-    xaxis=dict(
-        type="date",
 
-        # 🔥 REMOVE NON-MARKET HOURS
-        rangebreaks=[
-            # Skip nights
-            dict(bounds=["15:30", "09:15"], pattern="hour"),
-            # Skip weekends
-            dict(bounds=["sat", "mon"])
-        ],
-
-        tickformat="%H:%M",
-        dtick=15 * 60 * 1000,
-        rangeslider=dict(visible=False)
+    # X-axis labels (show time but NO gaps)
+    tick_step = max(len(df) // 10, 1)
+    fig.update_xaxes(
+        tickmode="array",
+        tickvals=df["x"][::tick_step],
+        ticktext=df["datetime"].dt.strftime("%d %b %H:%M")[::tick_step]
     )
-)
-###########################################
+
+    fig.update_layout(
+        title="NIFTY 15min MACD (Gap-Free Session View)",
+        template="plotly_white",
+        height=600,
+        xaxis_title="Time (Session Compressed)",
+        yaxis_title="Price",
+        showlegend=True
+    )
+
+    return fig.to_html(full_html=True)
+
 @app.route("/signal")
 def signal_api():
     df = get_nifty_15min()
