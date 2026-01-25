@@ -3,6 +3,7 @@ from flask import Flask, jsonify
 import pandas as pd
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from breeze_connect import BreezeConnect
 
 app = Flask(__name__)
@@ -42,7 +43,7 @@ def get_nifty_15min():
     df = pd.DataFrame(hist["Success"])
     df["datetime"] = pd.to_datetime(df["datetime"])
 
-    # Timezone-safe
+    # Timezone-safe (Render = UTC)
     if df["datetime"].dt.tz is None:
         df["datetime"] = df["datetime"].dt.tz_localize("Asia/Kolkata")
     else:
@@ -51,13 +52,13 @@ def get_nifty_15min():
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Market hours only
+    # NSE market hours only
     df = df[
         (df["datetime"].dt.time >= pd.to_datetime("09:15").time()) &
         (df["datetime"].dt.time <= pd.to_datetime("15:30").time())
     ]
 
-    # Resample to 15min
+    # Resample to 15 min
     df15 = (
         df.set_index("datetime")
         .resample("15min")
@@ -72,7 +73,7 @@ def get_nifty_15min():
         .reset_index()
     )
 
-    # 🔥 COMPRESSED SESSION INDEX (NO GAPS)
+    # 🔥 Compressed session index (NO GAPS)
     df15["x"] = range(len(df15))
 
     return df15
@@ -86,11 +87,12 @@ def macd_signals(df):
 
     macd = exp1 - exp2
     signal = macd.ewm(span=9).mean()
+    hist = macd - signal
 
     buy = (macd > 0) & (macd.shift(1) <= 0)
     sell = (macd < 0) & (macd.shift(1) >= 0)
 
-    return macd, signal, buy, sell
+    return macd, signal, hist, buy, sell
 
 # ==========================================================
 # ROUTES
@@ -98,55 +100,107 @@ def macd_signals(df):
 @app.route("/")
 def chart():
     df = get_nifty_15min()
-    macd, signal, buy, sell = macd_signals(df)
+    macd, signal, hist, buy, sell = macd_signals(df)
 
-    fig = go.Figure()
+    # ---------- SUBPLOTS (PRICE + MACD) ----------
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        row_heights=[0.7, 0.3],
+        subplot_titles=[
+            "NIFTY 15min Price (Gap-Free)",
+            "MACD (12,26,9)"
+        ]
+    )
 
-    # Candles (INDEX X-AXIS)
-    fig.add_trace(go.Candlestick(
-        x=df["x"],
-        open=df["open"],
-        high=df["high"],
-        low=df["low"],
-        close=df["close"],
-        name="NIFTY 15m",
-        hovertext=df["datetime"].dt.strftime("%Y-%m-%d %H:%M"),
-        hoverinfo="text"
-    ))
+    # ---------- PRICE CANDLES ----------
+    fig.add_trace(
+        go.Candlestick(
+            x=df["x"],
+            open=df["open"],
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            name="NIFTY 15m",
+            hovertext=df["datetime"].dt.strftime("%Y-%m-%d %H:%M"),
+            hoverinfo="text"
+        ),
+        row=1, col=1
+    )
 
     # BUY markers
-    fig.add_trace(go.Scatter(
-        x=df.loc[buy, "x"],
-        y=df.loc[buy, "low"] * 0.998,
-        mode="markers",
-        marker=dict(symbol="triangle-up", size=14, color="green"),
-        name="BUY"
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=df.loc[buy, "x"],
+            y=df.loc[buy, "low"] * 0.998,
+            mode="markers",
+            marker=dict(symbol="triangle-up", size=14, color="green"),
+            name="BUY"
+        ),
+        row=1, col=1
+    )
 
     # SELL markers
-    fig.add_trace(go.Scatter(
-        x=df.loc[sell, "x"],
-        y=df.loc[sell, "high"] * 1.002,
-        mode="markers",
-        marker=dict(symbol="triangle-down", size=14, color="red"),
-        name="SELL"
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=df.loc[sell, "x"],
+            y=df.loc[sell, "high"] * 1.002,
+            mode="markers",
+            marker=dict(symbol="triangle-down", size=14, color="red"),
+            name="SELL"
+        ),
+        row=1, col=1
+    )
 
-    # X-axis labels (show time but NO gaps)
-    tick_step = max(len(df) // 10, 1)
+    # ---------- MACD HISTOGRAM ----------
+    fig.add_trace(
+        go.Bar(
+            x=df["x"],
+            y=hist,
+            name="Histogram",
+            marker_color=["green" if h >= 0 else "red" for h in hist],
+            opacity=0.6
+        ),
+        row=2, col=1
+    )
+
+    # MACD line
+    fig.add_trace(
+        go.Scatter(
+            x=df["x"],
+            y=macd,
+            line=dict(color="blue", width=2),
+            name="MACD"
+        ),
+        row=2, col=1
+    )
+
+    # Signal line
+    fig.add_trace(
+        go.Scatter(
+            x=df["x"],
+            y=signal,
+            line=dict(color="orange", width=2),
+            name="Signal"
+        ),
+        row=2, col=1
+    )
+
+    # ---------- X-AXIS LABELS (TIME, NO GAPS) ----------
+    step = max(len(df) // 10, 1)
     fig.update_xaxes(
         tickmode="array",
-        tickvals=df["x"][::tick_step],
-        ticktext=df["datetime"].dt.strftime("%d %b %H:%M")[::tick_step]
+        tickvals=df["x"][::step],
+        ticktext=df["datetime"].dt.strftime("%d %b %H:%M")[::step],
+        row=2, col=1
     )
 
     fig.update_layout(
-        title="NIFTY 15min MACD (Gap-Free Session View)",
+        height=800,
         template="plotly_white",
-        height=600,
-        xaxis_title="Time (Session Compressed)",
-        yaxis_title="Price",
-        showlegend=True
+        showlegend=True,
+        title="NIFTY 15min MACD Strategy (Gap-Free Session Chart)"
     )
 
     return fig.to_html(full_html=True)
@@ -154,7 +208,7 @@ def chart():
 @app.route("/signal")
 def signal_api():
     df = get_nifty_15min()
-    macd, signal, buy, sell = macd_signals(df)
+    macd, signal, hist, buy, sell = macd_signals(df)
 
     latest = {
         "time": df["datetime"].iloc[-1].strftime("%Y-%m-%d %H:%M"),
