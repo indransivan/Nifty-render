@@ -123,21 +123,28 @@ def chart():
         marker=dict(symbol="triangle-down", size=14, color="red"),
         name="SELL"
     ))
+############################################
+fig.update_layout(
+    title="NIFTY 15min MACD (09:15–15:30 IST)",
+    template="plotly_white",
+    height=600,
+    xaxis=dict(
+        type="date",
 
-    fig.update_layout(
-        title="NIFTY 15min MACD (09:15–15:30 IST)",
-        template="plotly_white",
-        xaxis=dict(
-            type="date",
-            tickformat="%H:%M",
-            dtick=15 * 60 * 1000,
-            rangeslider=dict(visible=False)
-        ),
-        height=600
+        # 🔥 REMOVE NON-MARKET HOURS
+        rangebreaks=[
+            # Skip nights
+            dict(bounds=["15:30", "09:15"], pattern="hour"),
+            # Skip weekends
+            dict(bounds=["sat", "mon"])
+        ],
+
+        tickformat="%H:%M",
+        dtick=15 * 60 * 1000,
+        rangeslider=dict(visible=False)
     )
-
-    return fig.to_html(full_html=True)
-
+)
+###########################################
 @app.route("/signal")
 def signal_api():
     df = get_nifty_15min()
