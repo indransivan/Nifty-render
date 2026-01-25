@@ -1,31 +1,32 @@
 import os
 from flask import Flask, jsonify
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from breeze_connect import BreezeConnect
 
 app = Flask(__name__)
 
-# =========================
-# ENV VARIABLES
-# =========================
+# ==========================================================
+# ENV VARIABLES (SET IN RENDER DASHBOARD)
+# ==========================================================
 API_KEY = os.environ.get("BREEZE_API_KEY")
 API_SECRET = os.environ.get("BREEZE_API_SECRET")
 SESSION_TOKEN = os.environ.get("BREEZE_SESSION_TOKEN")
 
-# =========================
-# BREEZE LOGIN (once)
-# =========================
+# ==========================================================
+# LOGIN (ONCE)
+# ==========================================================
 breeze = BreezeConnect(api_key=API_KEY)
 breeze.generate_session(api_secret=API_SECRET, session_token=SESSION_TOKEN)
 
-# =========================
-# CORE LOGIC
-# =========================
-def get_nifty_data():
-    end = datetime.now()
+print("✅ Breeze login successful")
+
+# ==========================================================
+# FETCH + CLEAN DATA
+# ==========================================================
+def get_nifty_15min():
+    end = datetime.utcnow()
     start = end - timedelta(days=10)
     fmt = "%Y-%m-%d %H:%M:%S"
 
@@ -41,9 +42,22 @@ def get_nifty_data():
     df = pd.DataFrame(hist["Success"])
     df["datetime"] = pd.to_datetime(df["datetime"])
 
+    # ---------- TIMEZONE SAFE CONVERSION ----------
+    if df["datetime"].dt.tz is None:
+        df["datetime"] = df["datetime"].dt.tz_localize("Asia/Kolkata")
+    else:
+        df["datetime"] = df["datetime"].dt.tz_convert("Asia/Kolkata")
+
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    # ---------- FILTER NSE MARKET HOURS ----------
+    df = df[
+        (df["datetime"].dt.time >= pd.to_datetime("09:15").time()) &
+        (df["datetime"].dt.time <= pd.to_datetime("15:30").time())
+    ]
+
+    # ---------- RESAMPLE TO 15 MIN ----------
     df15 = (
         df.set_index("datetime")
         .resample("15min")
@@ -60,6 +74,9 @@ def get_nifty_data():
 
     return df15
 
+# ==========================================================
+# MACD LOGIC
+# ==========================================================
 def macd_signals(df):
     exp1 = df["close"].ewm(span=12).mean()
     exp2 = df["close"].ewm(span=26).mean()
@@ -72,12 +89,12 @@ def macd_signals(df):
 
     return macd, signal, buy, sell
 
-# =========================
+# ==========================================================
 # ROUTES
-# =========================
+# ==========================================================
 @app.route("/")
 def chart():
-    df = get_nifty_data()
+    df = get_nifty_15min()
     macd, signal, buy, sell = macd_signals(df)
 
     fig = go.Figure()
@@ -107,17 +124,27 @@ def chart():
         name="SELL"
     ))
 
-    fig.update_layout(title="NIFTY 15m MACD Signals", template="plotly_white")
+    fig.update_layout(
+        title="NIFTY 15min MACD (09:15–15:30 IST)",
+        template="plotly_white",
+        xaxis=dict(
+            type="date",
+            tickformat="%H:%M",
+            dtick=15 * 60 * 1000,
+            rangeslider=dict(visible=False)
+        ),
+        height=600
+    )
 
     return fig.to_html(full_html=True)
 
 @app.route("/signal")
 def signal_api():
-    df = get_nifty_data()
+    df = get_nifty_15min()
     macd, signal, buy, sell = macd_signals(df)
 
     latest = {
-        "time": df["datetime"].iloc[-1].isoformat(),
+        "time": df["datetime"].iloc[-1].strftime("%Y-%m-%d %H:%M"),
         "close": round(df["close"].iloc[-1], 2),
         "macd": round(macd.iloc[-1], 2),
         "signal": round(signal.iloc[-1], 2),
@@ -128,8 +155,12 @@ def signal_api():
 
     return jsonify(latest)
 
-# =========================
-# ENTRY POINT
-# =========================
+@app.route("/health")
+def health():
+    return {"status": "OK", "time": datetime.now().isoformat()}
+
+# ==========================================================
+# ENTRY POINT (RENDER)
+# ==========================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
