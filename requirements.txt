@@ -1,6 +1,5 @@
-streamlit==1.38.0
-breeze-connect==1.0.54
-pandas==2.2.2
-numpy==1.26.4
-plotly==5.22.0
-python-dotenv==1.0.1
+breeze-connect
+pandas
+numpy
+plotly
+
